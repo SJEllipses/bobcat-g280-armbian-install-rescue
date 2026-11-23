@@ -101,6 +101,22 @@ replace "$old_uuid" "$new_uuid"
 replace "$old_rpart" "$new_rpart"
 replace "$old_bpart" "$new_bpart"
 
+# eMMC enumeration can finish slightly later than the SD card used by the
+# source image. Make the kernel wait for the root device before mounting it.
+extlinux="$M/boot/extlinux/extlinux.conf"
+[[ -f "$extlinux" ]] || die "missing extlinux.conf on cloned eMMC boot partition"
+grep -q "UUID=$new_uuid" "$extlinux" || die "extlinux.conf does not reference the new eMMC root UUID"
+if ! grep -Eqi '^[[:space:]]*append .*([^[:alnum:]_]|^)rootwait([[:space:]=]|$)' "$extlinux"; then
+  echo "Adding rootwait to extlinux kernel command line ..."
+  sed -i '/^[[:space:]]*append / s/$/ rootwait/' "$extlinux"
+fi
+if ! grep -Eqi '^[[:space:]]*append .*([^[:alnum:]_]|^)rootdelay=([0-9]+)([[:space:]]|$)' "$extlinux"; then
+  echo "Adding rootdelay=5 to extlinux kernel command line ..."
+  sed -i '/^[[:space:]]*append / s/$/ rootdelay=5/' "$extlinux"
+fi
+grep -Eqi '^[[:space:]]*append .*([^[:alnum:]_]|^)rootwait([[:space:]=]|$)' "$extlinux" || die "failed to add rootwait"
+grep -Eqi '^[[:space:]]*append .*([^[:alnum:]_]|^)rootdelay=([0-9]+)([[:space:]]|$)' "$extlinux" || die "failed to add rootdelay"
+
 sync
 umount "$M/boot"
 umount "$M"
