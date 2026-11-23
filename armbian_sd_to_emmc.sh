@@ -54,17 +54,29 @@ dd if=$SRC of=$DST bs=512 skip=64 seek=64 count=32704 conv=nocreat,fsync status=
 dd if=$SRC_BOOT of=$DST_BOOT bs=4M conv=nocreat,fsync status=progress iflag=fullblock
 mkfs.ext4 -F -m 0 -L armbi_root "$DST_ROOT"
 
+echo "Mounting eMMC root filesystem ..."
 mkdir -p "$M" "$S"
 mount "$DST_ROOT" "$M"
+
 # Non-recursive bind exposes only the root mount, not /proc, /sys, /boot, zram,
 # or the destination mount. cp -a preserves permissions, links, timestamps, ACL/xattrs.
+echo "Binding live SD root filesystem for offline copy ..."
 mount --bind / "$S"
-cp -a "$S"/. "$M"/ || cp -a "$S"/. "$M"/
+
+echo "Copying SD root filesystem to eMMC; this can take several minutes ..."
+if ! cp -a "$S"/. "$M"/; then
+  echo "First copy pass failed; retrying once ..."
+  cp -a "$S"/. "$M"/
+fi
+
+echo "Root filesystem copy finished; unbinding TF root ..."
 umount "$S"
 rmdir "$S"
 
 install -d -m 0755 "$M"/{proc,sys,dev,run,tmp,mnt,media,var/log,var/log.hdd}
 chmod 1777 "$M/tmp"
+
+echo "Mounting cloned eMMC boot partition ..."
 mkdir -p "$M/boot"
 mount "$DST_BOOT" "$M/boot"
 
