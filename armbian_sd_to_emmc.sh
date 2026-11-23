@@ -24,10 +24,10 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || die "run with sudo"
 [[ -b $SRC && -b $DST ]] || die "expected /dev/mmcblk0 and /dev/mmcblk2"
 [[ -e /sys/block/mmcblk2/mmcblk2boot0 && -e /sys/block/mmcblk2/mmcblk2boot1 ]] || die "/dev/mmcblk2 is not eMMC"
-findmnt -rn -S "$SRC_BOOT" -o TARGET | grep -qx /boot || die "TF p1 is not mounted at /boot"
-findmnt -rn -S "$SRC_ROOT" -o TARGET | grep -qx / || die "TF p2 is not the running root"
-[[ $(cat /sys/block/mmcblk0/mmcblk0p1/start) == 32768 ]] || die "TF p1 must start at LBA 32768"
-[[ $(blockdev --getsize64 "$SRC_BOOT") -le $((512*1024*1024)) ]] || die "TF /boot is larger than 512 MiB"
+findmnt -rn -S "$SRC_BOOT" -o TARGET | grep -qx /boot || die "SD p1 is not mounted at /boot"
+findmnt -rn -S "$SRC_ROOT" -o TARGET | grep -qx / || die "SD p2 is not the running root"
+[[ $(cat /sys/block/mmcblk0/mmcblk0p1/start) == 32768 ]] || die "SD p1 must start at LBA 32768"
+[[ $(blockdev --getsize64 "$SRC_BOOT") -le $((512*1024*1024)) ]] || die "SD /boot is larger than 512 MiB"
 [[ -z $(lsblk -nrno PATH,MOUNTPOINTS "$DST" | awk 'NF>1') ]] || die "eMMC or one of its partitions is mounted"
 
 used=$(df -B1 -P / | awk 'NR==2 {print $3}')
@@ -69,7 +69,7 @@ if ! cp -a "$S"/. "$M"/; then
   cp -a "$S"/. "$M"/
 fi
 
-echo "Root filesystem copy finished; unbinding TF root ..."
+echo "Root filesystem copy finished; unbinding SD root ..."
 umount "$S"
 rmdir "$S"
 
@@ -80,7 +80,7 @@ echo "Mounting cloned eMMC boot partition ..."
 mkdir -p "$M/boot"
 mount "$DST_BOOT" "$M/boot"
 
-# Replace all TF root references with the new eMMC root UUID.
+# Replace all SD root references with the new eMMC root UUID.
 old_uuid=$(blkid -s UUID -o value "$SRC_ROOT")
 new_uuid=$(blkid -s UUID -o value "$DST_ROOT")
 old_rpart=$(blkid -s PARTUUID -o value "$SRC_ROOT")
