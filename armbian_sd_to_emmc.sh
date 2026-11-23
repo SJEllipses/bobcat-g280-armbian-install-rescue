@@ -10,6 +10,8 @@ DST_BOOT=${DST}p1
 DST_ROOT=${DST}p2
 M=/mnt/g280-emmc
 S=/mnt/g280-source
+NODE_P1=""
+NODE_P2=""
 
 cleanup() {
   sync || true
@@ -17,6 +19,7 @@ cleanup() {
   umount "$M" 2>/dev/null || true
   umount "$S" 2>/dev/null || true
   rmdir "$M" "$S" 2>/dev/null || true
+  rm -f "$NODE_P1" "$NODE_P2" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -42,12 +45,35 @@ start=32768, size=1048576, type=linuxfilesystem, name=boot
 start=1081344, type=linuxfilesystem, name=root
 PART
 blockdev --rereadpt "$DST"
-udevadm settle --timeout=30 2>/dev/null || true
-for i in {1..50}; do
-  [[ -b $DST_BOOT && -b $DST_ROOT ]] && break
+
+# Wait for kernel partition objects. Do not depend on udev's /dev names:
+# udev can briefly remove/recreate /dev/mmcblk2pN while this script continues.
+for i in {1..100}; do
+  [[ -r /sys/block/mmcblk2/mmcblk2p1/dev && -r /sys/block/mmcblk2/mmcblk2p2/dev ]] && break
   sleep 0.1
 done
-[[ -b $DST_BOOT && -b $DST_ROOT ]] || die "new eMMC partition nodes did not appear as block devices"
+[[ -r /sys/block/mmcblk2/mmcblk2p1/dev && -r /sys/block/mmcblk2/mmcblk2p2/dev ]] || \
+  die "kernel partition objects did not appear in sysfs"
+
+p1dev=$(cat /sys/block/mmcblk2/mmcblk2p1/dev)
+p2dev=$(cat /sys/block/mmcblk2/mmcblk2p2/dev)
+p1major=${p1dev%:*}; p1minor=${p1dev#*:}
+p2major=${p2dev%:*}; p2minor=${p2dev#*:}
+[[ $p1major =~ ^[0-9]+$ && $p1minor =~ ^[0-9]+$ ]] || die "invalid eMMC p1 major/minor: $p1dev"
+[[ $p2major =~ ^[0-9]+$ && $p2minor =~ ^[0-9]+$ ]] || die "invalid eMMC p2 major/minor: $p2dev"
+
+# Private block nodes are created from the kernel major/minor and are not
+# removed by udev. All later writes and mounts use these stable nodes.
+NODE_P1=/tmp/g280-emmc-p1.$$
+NODE_P2=/tmp/g280-emmc-p2.$$
+rm -f "$NODE_P1" "$NODE_P2"
+mknod -m 660 "$NODE_P1" b "$p1major" "$p1minor"
+mknod -m 660 "$NODE_P2" b "$p2major" "$p2minor"
+[[ -b $NODE_P1 && -b $NODE_P2 ]] || die "failed to create private eMMC block nodes"
+[[ $(cat /sys/block/mmcblk2/mmcblk2p1/size) == 1048576 ]] || die "unexpected eMMC p1 size"
+(( $(cat /sys/block/mmcblk2/mmcblk2p2/size) > 0 )) || die "unexpected eMMC p2 size"
+DST_BOOT=$NODE_P1
+DST_ROOT=$NODE_P2
 
 # Copy Rockchip IDBlock/loader area, then the complete boot filesystem.
 dd if=$SRC of=$DST bs=512 skip=64 seek=64 count=32704 conv=nocreat,fsync status=progress
