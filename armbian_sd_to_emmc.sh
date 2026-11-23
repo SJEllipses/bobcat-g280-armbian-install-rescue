@@ -16,7 +16,7 @@ cleanup() {
   umount "$M/boot" 2>/dev/null || true
   umount "$M" 2>/dev/null || true
   umount "$S" 2>/dev/null || true
-  rmdir "$M/boot" "$M" "$S" 2>/dev/null || true
+  rmdir "$M" "$S" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -43,11 +43,15 @@ start=1081344, type=linuxfilesystem, name=root
 PART
 blockdev --rereadpt "$DST"
 udevadm settle --timeout=30 2>/dev/null || true
-[[ -b $DST_BOOT && -b $DST_ROOT ]] || die "new eMMC partitions did not appear"
+for i in {1..50}; do
+  [[ -b $DST_BOOT && -b $DST_ROOT ]] && break
+  sleep 0.1
+done
+[[ -b $DST_BOOT && -b $DST_ROOT ]] || die "new eMMC partition nodes did not appear as block devices"
 
 # Copy Rockchip IDBlock/loader area, then the complete boot filesystem.
-dd if=$SRC of=$DST bs=512 skip=64 seek=64 count=32704 conv=fsync status=progress
-dd if=$SRC_BOOT of=$DST_BOOT bs=4M conv=fsync status=progress iflag=fullblock
+dd if=$SRC of=$DST bs=512 skip=64 seek=64 count=32704 conv=nocreat,fsync status=progress
+dd if=$SRC_BOOT of=$DST_BOOT bs=4M conv=nocreat,fsync status=progress iflag=fullblock
 mkfs.ext4 -F -m 0 -L armbi_root "$DST_ROOT"
 
 mkdir -p "$M" "$S"
@@ -88,5 +92,5 @@ replace "$old_bpart" "$new_bpart"
 sync
 umount "$M/boot"
 umount "$M"
-rmdir "$M/boot" "$M"
+rmdir "$M"
 echo "Done. Power off, remove the micro SD card, then boot from eMMC."
