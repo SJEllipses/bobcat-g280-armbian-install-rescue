@@ -106,22 +106,22 @@ replace "$old_bpart" "$new_bpart"
 extlinux="$M/boot/extlinux/extlinux.conf"
 [[ -f "$extlinux" ]] || die "missing extlinux.conf on cloned eMMC boot partition"
 grep -q "UUID=$new_uuid" "$extlinux" || die "extlinux.conf does not reference the new eMMC root UUID"
-echo "Boot command line before root-device fixes:"
-grep -i '^[[:space:]]*append' "$extlinux" || true
+echo "Boot root command line before fixes:"
+grep -i 'root=' "$extlinux" || true
 
-if ! grep -Eqi '^[[:space:]]*append .*rootwait' "$extlinux"; then
-  echo "Adding rootwait to extlinux kernel command line ..."
-  sed -i '/^[[:space:]]*[Aa][Pp][Pp][Ee][Nn][Dd][[:space:]]/ s/$/ rootwait/' "$extlinux"
+if ! grep -Eqi 'root=.*rootwait|rootwait.*root=' "$extlinux"; then
+  echo "Adding rootwait to the line containing root= ..."
+  sed -i '/root=/ s/$/ rootwait/' "$extlinux"
 fi
-if ! grep -Eqi '^[[:space:]]*append .*rootdelay=' "$extlinux"; then
-  echo "Adding rootdelay=5 to extlinux kernel command line ..."
-  sed -i '/^[[:space:]]*[Aa][Pp][Pp][Ee][Nn][Dd][[:space:]]/ s/$/ rootdelay=5/' "$extlinux"
+if ! grep -Eqi 'root=.*rootdelay=|rootdelay=.*root=' "$extlinux"; then
+  echo "Adding rootdelay=5 to the line containing root= ..."
+  sed -i '/root=/ s/$/ rootdelay=5/' "$extlinux"
 fi
 
-echo "Boot command line after root-device fixes:"
-grep -i '^[[:space:]]*append' "$extlinux" || true
-grep -Eqi '^[[:space:]]*append .*rootwait' "$extlinux" || die "failed to add rootwait"
-grep -Eqi '^[[:space:]]*append .*rootdelay=' "$extlinux" || die "failed to add rootdelay"
+echo "Boot root command line after fixes:"
+grep -i 'root=' "$extlinux" || true
+grep -Eqi 'root=.*rootwait|rootwait.*root=' "$extlinux" || die "failed to add rootwait"
+grep -Eqi 'root=.*rootdelay=|rootdelay=.*root=' "$extlinux" || die "failed to add rootdelay"
 
 sync
 umount "$M/boot"
