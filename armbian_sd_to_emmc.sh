@@ -57,7 +57,7 @@ add_missing_pkg sgdisk gdisk
 add_missing_pkg partprobe parted
 add_missing_pkg rsync rsync
 add_missing_pkg mkfs.ext4 e2fsprogs
-if [[ -f /boot/boot.scr && -f /boot/boot.cmd ]]; then
+if [[ -f /boot/boot.scr ]]; then
   add_missing_pkg mkimage u-boot-tools
 fi
 
@@ -114,6 +114,7 @@ mount "$DST_ROOT" "$M"
 mount "$DST_BOOT" "$M/boot"
 
 echo "Copying SD root filesystem with rsync ..."
+rsync_rc=0
 rsync -aHAXx --numeric-ids --delete --info=progress2 \
   --exclude='/proc/*' \
   --exclude='/sys/*' \
@@ -125,7 +126,16 @@ rsync -aHAXx --numeric-ids --delete --info=progress2 \
   --exclude='/boot/*' \
   --exclude='/var/log.hdd/*' \
   --exclude='/lost+found' \
-  / "$M/"
+  / "$M/" || rsync_rc=$?
+
+# Exit 24 means some source files vanished while the live system was running.
+# That is normal for a running Armbian root and must not abort the clone before
+# UUID/boot configuration fixes are applied.
+if (( rsync_rc != 0 && rsync_rc != 24 )); then
+  die "rsync failed with exit code $rsync_rc"
+elif (( rsync_rc == 24 )); then
+  echo "rsync reported transient source-file changes (exit 24); continuing ..."
+fi
 
 install -d -m 0755 \
   "$M"/proc "$M"/sys "$M"/dev "$M"/run "$M"/tmp \
@@ -143,6 +153,31 @@ boot_uuid=$(blkid -s UUID -o value "$DST_BOOT")
 [[ -n $old_uuid && -n $new_uuid ]] || die "cannot read root UUIDs"
 [[ -n $boot_uuid ]] || die "cannot read eMMC boot UUID"
 
+# Some Armbian images ship only a binary boot.scr. A legacy U-Boot script
+# image has a 64-byte header followed by the plain-text script, so extract it
+# directly instead of relying on dumpimage (which rejects script images).
+if [[ -f "$M/boot/boot.scr" && ! -f "$M/boot/boot.cmd" ]]; then
+  echo "Extracting boot.cmd from existing boot.scr ..."
+  dd if="$M/boot/boot.scr" of="$M/boot/boot.cmd" bs=64 skip=1 status=none
+fi
+
+# Make sure armbianEnv.txt explicitly points at the eMMC root and waits for it.
+armbian_env="$M/boot/armbianEnv.txt"
+if [[ -f "$armbian_env" ]]; then
+  if grep -q '^rootdev=' "$armbian_env"; then
+    sed -i "s|^rootdev=.*|rootdev=UUID=$new_uuid|" "$armbian_env"
+  else
+    echo "rootdev=UUID=$new_uuid" >> "$armbian_env"
+  fi
+
+  # boot.cmd usually expands ${extraargs}; put the wait flags there.
+  if grep -q '^extraargs=' "$armbian_env"; then
+    sed -i '/^extraargs=/ { /rootwait/! s/$/ rootwait/; /rootdelay=/! s/$/ rootdelay=5/ }' "$armbian_env"
+  else
+    echo "extraargs=rootwait rootdelay=5" >> "$armbian_env"
+  fi
+fi
+
 replace() {
   grep -RIlZ -- "$1" "$M/boot" "$M/etc" 2>/dev/null |
   while IFS= read -r -d '' f; do
@@ -158,9 +193,28 @@ replace "$old_bpart" "$new_bpart"
 
 # Armbian often boots via a binary boot.scr generated from boot.cmd. The text
 # replacement above updates boot.cmd, so regenerate boot.scr when both exist.
+if [[ -f "$M/boot/boot.cmd" ]]; then
+  # Force the root device in boot.cmd itself. Do not rely on U-Boot's saved
+  # environment or on armbianEnv.txt being imported by every boot.cmd variant.
+  if grep -q '^setenv rootdev' "$M/boot/boot.cmd"; then
+    sed -i "s|^setenv rootdev .*|setenv rootdev UUID=$new_uuid|" "$M/boot/boot.cmd"
+  else
+    sed -i "1i setenv rootdev UUID=$new_uuid" "$M/boot/boot.cmd"
+  fi
+  if ! grep -q '^setenv rootfstype' "$M/boot/boot.cmd"; then
+    sed -i "1i setenv rootfstype ext4" "$M/boot/boot.cmd"
+  fi
+
+  # Put the root-device wait flags on the actual bootargs line. This works even
+  # when boot.cmd builds bootargs from armbianEnv.txt variables.
+  if ! grep -q 'rootwait' "$M/boot/boot.cmd"; then
+    sed -i '/setenv bootargs/ s/"[[:space:]]*$/ rootwait rootdelay=5"/' "$M/boot/boot.cmd"
+  fi
+fi
+
 if [[ -f "$M/boot/boot.cmd" && -f "$M/boot/boot.scr" ]]; then
   echo "Regenerating boot.scr from updated boot.cmd ..."
-  mkimage -C arm -T script -d "$M/boot/boot.cmd" "$M/boot/boot.scr"
+  mkimage -C none -T script -d "$M/boot/boot.cmd" "$M/boot/boot.scr"
 fi
 
 # PX30 eMMC can enumerate slightly later than SD. Ensure the kernel waits.
@@ -193,6 +247,22 @@ for f in "$M/boot/extlinux/extlinux.conf" "$M/boot/armbianEnv.txt"          "$M/
     die "boot configuration still references the SD card"
   fi
 done
+
+echo "Final boot configuration summary:"
+echo "  eMMC root UUID: $new_uuid"
+echo "  eMMC boot UUID: $boot_uuid"
+if [[ -f "$M/boot/extlinux/extlinux.conf" ]]; then
+  echo "  extlinux root line:"
+  grep -i 'root=' "$M/boot/extlinux/extlinux.conf" || true
+fi
+if [[ -f "$M/boot/armbianEnv.txt" ]]; then
+  echo "  armbianEnv root/extraargs:"
+  grep -E '^(rootdev|extraargs)=' "$M/boot/armbianEnv.txt" || true
+fi
+if [[ -f "$M/boot/boot.scr" ]]; then
+  echo "  boot.scr root references:"
+  strings "$M/boot/boot.scr" | grep -Ei 'root=|rootdev|mmcblk|UUID=' || true
+fi
 
 echo "Syncing and unmounting ..."
 sync
