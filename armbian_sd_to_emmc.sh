@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Offline G280/PX30 installer: clone running Armbian from micro SD to eMMC.
+# Clone the running Armbian SD installation to the G280/PX30 eMMC.
+# Fixed devices: SD=/dev/mmcblk0, eMMC=/dev/mmcblk2
+# This is the tested sgdisk + partprobe + rsync method.
 set -Eeuo pipefail
 
 SRC=/dev/mmcblk0
@@ -9,27 +11,26 @@ SRC_ROOT=${SRC}p2
 DST_BOOT=${DST}p1
 DST_ROOT=${DST}p2
 M=/mnt/g280-emmc
-S=/mnt/g280-source
-NODE_P1=""
-NODE_P2=""
 
 cleanup() {
   sync || true
   umount "$M/boot" 2>/dev/null || true
   umount "$M" 2>/dev/null || true
-  umount "$S" 2>/dev/null || true
-  rmdir "$M" "$S" 2>/dev/null || true
-  rm -f "$NODE_P1" "$NODE_P2" 2>/dev/null || true
+  rmdir "$M" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 die() { echo "ERROR: $*" >&2; exit 1; }
+
+echo "Checking SD and eMMC layout ..."
 [[ $EUID -eq 0 ]] || die "run with sudo"
 [[ -b $SRC && -b $DST ]] || die "expected /dev/mmcblk0 and /dev/mmcblk2"
 [[ -e /sys/block/mmcblk2/mmcblk2boot0 && -e /sys/block/mmcblk2/mmcblk2boot1 ]] || die "/dev/mmcblk2 is not eMMC"
 findmnt -rn -S "$SRC_BOOT" -o TARGET | grep -qx /boot || die "SD p1 is not mounted at /boot"
 findmnt -rn -S "$SRC_ROOT" -o TARGET | grep -qx / || die "SD p2 is not the running root"
-[[ $(cat /sys/block/mmcblk0/mmcblk0p1/start) == 32768 ]] || die "SD p1 must start at LBA 32768"
+
+SRC_BOOT_START=$(cat /sys/block/mmcblk0/mmcblk0p1/start)
+[[ $SRC_BOOT_START == 32768 ]] || die "SD p1 must start at LBA 32768 (got $SRC_BOOT_START)"
 [[ $(blockdev --getsize64 "$SRC_BOOT") -le $((512*1024*1024)) ]] || die "SD /boot is larger than 512 MiB"
 [[ -z $(lsblk -nrno PATH,MOUNTPOINTS "$DST" | awk 'NF>1') ]] || die "eMMC or one of its partitions is mounted"
 
@@ -37,83 +38,105 @@ used=$(df -B1 -P / | awk 'NR==2 {print $3}')
 available=$(( ($(cat /sys/block/mmcblk2/size) - 1081472) * 512 ))
 (( used + (512*1024*1024) < available )) || die "not enough space on eMMC"
 
-echo "Erasing and installing Armbian to $DST ..."
-sfdisk --force "$DST" <<'PART'
-label: gpt
-unit: sectors
-start=32768, size=1048576, type=linuxfilesystem, name=boot
-start=1081344, type=linuxfilesystem, name=root
-PART
-blockdev --rereadpt "$DST"
+# Install the four optional tools if they are missing. Package names:
+#   sgdisk     -> gdisk
+#   partprobe  -> parted
+#   rsync      -> rsync
+#   mkfs.ext4  -> e2fsprogs
+missing_pkgs=""
+add_missing_pkg() {
+  local cmd=$1 pkg=$2
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    case " $missing_pkgs " in
+      *" $pkg "*) ;;
+      *) missing_pkgs+=" $pkg" ;;
+    esac
+  fi
+}
+add_missing_pkg sgdisk gdisk
+add_missing_pkg partprobe parted
+add_missing_pkg rsync rsync
+add_missing_pkg mkfs.ext4 e2fsprogs
 
-# Wait for kernel partition objects. Do not depend on udev's /dev names:
-# udev can briefly remove/recreate /dev/mmcblk2pN while this script continues.
-for i in {1..100}; do
-  [[ -r /sys/block/mmcblk2/mmcblk2p1/dev && -r /sys/block/mmcblk2/mmcblk2p2/dev ]] && break
-  sleep 0.1
-done
-[[ -r /sys/block/mmcblk2/mmcblk2p1/dev && -r /sys/block/mmcblk2/mmcblk2p2/dev ]] || \
-  die "kernel partition objects did not appear in sysfs"
-
-p1dev=$(cat /sys/block/mmcblk2/mmcblk2p1/dev)
-p2dev=$(cat /sys/block/mmcblk2/mmcblk2p2/dev)
-p1major=${p1dev%:*}; p1minor=${p1dev#*:}
-p2major=${p2dev%:*}; p2minor=${p2dev#*:}
-[[ $p1major =~ ^[0-9]+$ && $p1minor =~ ^[0-9]+$ ]] || die "invalid eMMC p1 major/minor: $p1dev"
-[[ $p2major =~ ^[0-9]+$ && $p2minor =~ ^[0-9]+$ ]] || die "invalid eMMC p2 major/minor: $p2dev"
-
-# Private block nodes are created from the kernel major/minor and are not
-# removed by udev. All later writes and mounts use these stable nodes.
-NODE_P1=/tmp/g280-emmc-p1.$$
-NODE_P2=/tmp/g280-emmc-p2.$$
-rm -f "$NODE_P1" "$NODE_P2"
-mknod -m 660 "$NODE_P1" b "$p1major" "$p1minor"
-mknod -m 660 "$NODE_P2" b "$p2major" "$p2minor"
-[[ -b $NODE_P1 && -b $NODE_P2 ]] || die "failed to create private eMMC block nodes"
-[[ $(cat /sys/block/mmcblk2/mmcblk2p1/size) == 1048576 ]] || die "unexpected eMMC p1 size"
-(( $(cat /sys/block/mmcblk2/mmcblk2p2/size) > 0 )) || die "unexpected eMMC p2 size"
-DST_BOOT=$NODE_P1
-DST_ROOT=$NODE_P2
-
-# Copy Rockchip IDBlock/loader area, then the complete boot filesystem.
-dd if=$SRC of=$DST bs=512 skip=64 seek=64 count=32704 conv=nocreat,fsync status=progress
-dd if=$SRC_BOOT of=$DST_BOOT bs=4M conv=nocreat,fsync status=progress iflag=fullblock
-mkfs.ext4 -F -m 0 -L armbi_root "$DST_ROOT"
-
-echo "Mounting eMMC root filesystem ..."
-mkdir -p "$M" "$S"
-mount "$DST_ROOT" "$M"
-
-# Non-recursive bind exposes only the root mount, not /proc, /sys, /boot, zram,
-# or the destination mount. cp -a preserves permissions, links, timestamps, ACL/xattrs.
-echo "Binding live SD root filesystem for offline copy ..."
-mount --bind / "$S"
-
-echo "Copying SD root filesystem to eMMC; this can take several minutes ..."
-if ! cp -a "$S"/. "$M"/; then
-  echo "First copy pass failed; retrying once ..."
-  cp -a "$S"/. "$M"/
+if [[ -n "${missing_pkgs# }" ]]; then
+  echo "Missing tools; installing packages:${missing_pkgs}"
+  command -v apt >/dev/null 2>&1 || die "apt not found; install manually:${missing_pkgs}"
+  export DEBIAN_FRONTEND=noninteractive
+  apt update
+  # shellcheck disable=SC2086
+  apt install -y --no-install-recommends $missing_pkgs
 fi
 
-echo "Root filesystem copy finished; unbinding SD root ..."
-umount "$S"
-rmdir "$S"
+for cmd in sgdisk partprobe rsync mkfs.ext4 blkid findmnt lsblk blockdev dd sed grep install df awk udevadm; do
+  command -v "$cmd" >/dev/null 2>&1 || die "missing command after package installation: $cmd"
+done
 
-install -d -m 0755 "$M"/{proc,sys,dev,run,tmp,mnt,media,var/log,var/log.hdd}
-chmod 1777 "$M/tmp"
+echo "Creating GPT with sgdisk on $DST ..."
+sgdisk --zap-all "$DST"
+sgdisk --clear \
+  --new=1:32768:+512M \
+  --typecode=1:8300 \
+  --change-name=1:boot \
+  --new=2:0:0 \
+  --typecode=2:8300 \
+  --change-name=2:root \
+  "$DST"
 
-echo "Mounting cloned eMMC boot partition ..."
-mkdir -p "$M/boot"
+echo "Refreshing partition table ..."
+partprobe "$DST"
+udevadm settle --timeout=30
+
+for i in {1..50}; do
+  [[ -b $DST_BOOT && -b $DST_ROOT ]] && break
+  sleep 0.1
+done
+[[ -b $DST_BOOT && -b $DST_ROOT ]] || die "new eMMC partition nodes did not appear"
+udevadm settle --timeout=30
+[[ -b $DST_BOOT && -b $DST_ROOT ]] || die "eMMC partition nodes disappeared after udev settle"
+[[ $(blockdev --getsize64 "$DST_BOOT") == 536870912 ]] || die "unexpected eMMC boot partition size"
+
+echo "Copying Rockchip bootloader raw area ..."
+dd if="$SRC" of="$DST" bs=512 skip=64 seek=64 \
+  count=$((SRC_BOOT_START-64)) conv=nocreat,fsync status=progress
+
+echo "Cloning SD /boot partition ..."
+dd if="$SRC_BOOT" of="$DST_BOOT" bs=4M conv=nocreat,fsync status=progress iflag=fullblock
+
+echo "Creating ext4 root filesystem ..."
+mkfs.ext4 -F -L armbi_root "$DST_ROOT"
+
+echo "Mounting eMMC filesystems ..."
+mkdir -p "$M" "$M/boot"
+mount "$DST_ROOT" "$M"
 mount "$DST_BOOT" "$M/boot"
 
-# Replace all SD root references with the new eMMC root UUID.
+echo "Copying SD root filesystem with rsync ..."
+rsync -aHAXx --numeric-ids --delete --info=progress2 \
+  --exclude='/proc/*' \
+  --exclude='/sys/*' \
+  --exclude='/dev/*' \
+  --exclude='/run/*' \
+  --exclude='/tmp/*' \
+  --exclude='/mnt/*' \
+  --exclude='/media/*' \
+  --exclude='/boot/*' \
+  --exclude='/var/log.hdd/*' \
+  --exclude='/lost+found' \
+  / "$M/"
+
+install -d -m 0755 \
+  "$M"/proc "$M"/sys "$M"/dev "$M"/run "$M"/tmp \
+  "$M"/mnt "$M"/media "$M"/var/log.hdd
+chmod 1777 "$M/tmp"
+
+echo "Updating root UUID and PARTUUID references ..."
 old_uuid=$(blkid -s UUID -o value "$SRC_ROOT")
 new_uuid=$(blkid -s UUID -o value "$DST_ROOT")
 old_rpart=$(blkid -s PARTUUID -o value "$SRC_ROOT")
 new_rpart=$(blkid -s PARTUUID -o value "$DST_ROOT")
 old_bpart=$(blkid -s PARTUUID -o value "$SRC_BOOT")
 new_bpart=$(blkid -s PARTUUID -o value "$DST_BOOT")
-[[ -n $old_uuid && -n $new_uuid ]] || die "cannot read filesystem UUIDs"
+[[ -n $old_uuid && -n $new_uuid ]] || die "cannot read root UUIDs"
 
 replace() {
   grep -RIlZ -- "$1" "$M/boot" "$M/etc" 2>/dev/null |
@@ -127,30 +150,31 @@ replace "$old_uuid" "$new_uuid"
 replace "$old_rpart" "$new_rpart"
 replace "$old_bpart" "$new_bpart"
 
-# eMMC enumeration can finish slightly later than the SD card used by the
-# source image. Make the kernel wait for the root device before mounting it.
+# PX30 eMMC can enumerate slightly later than SD. Ensure the kernel waits.
 extlinux="$M/boot/extlinux/extlinux.conf"
-[[ -f "$extlinux" ]] || die "missing extlinux.conf on cloned eMMC boot partition"
-grep -q "UUID=$new_uuid" "$extlinux" || die "extlinux.conf does not reference the new eMMC root UUID"
-echo "Boot root command line before fixes:"
-grep -i 'root=' "$extlinux" || true
+if [[ -f "$extlinux" ]]; then
+  echo "Boot root command line before fixes:"
+  grep -i 'root=' "$extlinux" || true
 
-if ! grep -Eqi 'root=.*rootwait|rootwait.*root=' "$extlinux"; then
-  echo "Adding rootwait to the line containing root= ..."
-  sed -i '/root=/ s/$/ rootwait/' "$extlinux"
+  if ! grep -Eqi 'root=.*rootwait|rootwait.*root=' "$extlinux"; then
+    echo "Adding rootwait ..."
+    sed -i '/root=/ s/$/ rootwait/' "$extlinux"
+  fi
+  if ! grep -Eqi 'root=.*rootdelay=|rootdelay=.*root=' "$extlinux"; then
+    echo "Adding rootdelay=5 ..."
+    sed -i '/root=/ s/$/ rootdelay=5/' "$extlinux"
+  fi
+
+  echo "Boot root command line after fixes:"
+  grep -i 'root=' "$extlinux" || true
+  grep -Eqi 'root=.*rootwait|rootwait.*root=' "$extlinux" || die "failed to add rootwait"
+  grep -Eqi 'root=.*rootdelay=|rootdelay=.*root=' "$extlinux" || die "failed to add rootdelay"
 fi
-if ! grep -Eqi 'root=.*rootdelay=|rootdelay=.*root=' "$extlinux"; then
-  echo "Adding rootdelay=5 to the line containing root= ..."
-  sed -i '/root=/ s/$/ rootdelay=5/' "$extlinux"
-fi
 
-echo "Boot root command line after fixes:"
-grep -i 'root=' "$extlinux" || true
-grep -Eqi 'root=.*rootwait|rootwait.*root=' "$extlinux" || die "failed to add rootwait"
-grep -Eqi 'root=.*rootdelay=|rootdelay=.*root=' "$extlinux" || die "failed to add rootdelay"
-
+echo "Syncing and unmounting ..."
 sync
 umount "$M/boot"
 umount "$M"
 rmdir "$M"
+
 echo "Done. Power off, remove the micro SD card, then boot from eMMC."
