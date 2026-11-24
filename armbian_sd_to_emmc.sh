@@ -57,6 +57,9 @@ add_missing_pkg sgdisk gdisk
 add_missing_pkg partprobe parted
 add_missing_pkg rsync rsync
 add_missing_pkg mkfs.ext4 e2fsprogs
+if [[ -f /boot/boot.scr && -f /boot/boot.cmd ]]; then
+  add_missing_pkg mkimage u-boot-tools
+fi
 
 if [[ -n "${missing_pkgs# }" ]]; then
   echo "Missing tools; installing packages:${missing_pkgs}"
@@ -136,7 +139,9 @@ old_rpart=$(blkid -s PARTUUID -o value "$SRC_ROOT")
 new_rpart=$(blkid -s PARTUUID -o value "$DST_ROOT")
 old_bpart=$(blkid -s PARTUUID -o value "$SRC_BOOT")
 new_bpart=$(blkid -s PARTUUID -o value "$DST_BOOT")
+boot_uuid=$(blkid -s UUID -o value "$DST_BOOT")
 [[ -n $old_uuid && -n $new_uuid ]] || die "cannot read root UUIDs"
+[[ -n $boot_uuid ]] || die "cannot read eMMC boot UUID"
 
 replace() {
   grep -RIlZ -- "$1" "$M/boot" "$M/etc" 2>/dev/null |
@@ -146,9 +151,17 @@ replace() {
   done || true
 }
 replace "$SRC_ROOT" "UUID=$new_uuid"
+replace "$SRC_BOOT" "UUID=$boot_uuid"
 replace "$old_uuid" "$new_uuid"
 replace "$old_rpart" "$new_rpart"
 replace "$old_bpart" "$new_bpart"
+
+# Armbian often boots via a binary boot.scr generated from boot.cmd. The text
+# replacement above updates boot.cmd, so regenerate boot.scr when both exist.
+if [[ -f "$M/boot/boot.cmd" && -f "$M/boot/boot.scr" ]]; then
+  echo "Regenerating boot.scr from updated boot.cmd ..."
+  mkimage -C arm -T script -d "$M/boot/boot.cmd" "$M/boot/boot.scr"
+fi
 
 # PX30 eMMC can enumerate slightly later than SD. Ensure the kernel waits.
 extlinux="$M/boot/extlinux/extlinux.conf"
@@ -170,6 +183,16 @@ if [[ -f "$extlinux" ]]; then
   grep -Eqi 'root=.*rootwait|rootwait.*root=' "$extlinux" || die "failed to add rootwait"
   grep -Eqi 'root=.*rootdelay=|rootdelay=.*root=' "$extlinux" || die "failed to add rootdelay"
 fi
+
+# Refuse to finish if the cloned boot configuration still points at the SD root.
+for f in "$M/boot/extlinux/extlinux.conf" "$M/boot/armbianEnv.txt"          "$M/boot/boot.cmd" "$M/boot/boot.scr" "$M/etc/fstab"; do
+  [[ -f "$f" ]] || continue
+  if grep -a -q -e "$SRC_ROOT" -e "$SRC_BOOT" -e "$old_uuid" -e "$old_rpart" "$f"; then
+    echo "ERROR: old SD root/boot reference remains in $f:"
+    grep -a -n -e "$SRC_ROOT" -e "$SRC_BOOT" -e "$old_uuid" -e "$old_rpart" "$f" || true
+    die "boot configuration still references the SD card"
+  fi
+done
 
 echo "Syncing and unmounting ..."
 sync
